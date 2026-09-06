@@ -29,7 +29,7 @@ def test_vision_warmup_calls_only_position_and_rotary_paths() -> None:
         def __init__(self) -> None:
             torch.nn.Module.__init__(self)
             self.blocks = [SimpleNamespace(attn=FakeAttention())]
-            self.pos_embed = torch.nn.Embedding(4, 4)
+            self.pos_embed = torch.nn.Embedding(4, 4, device="cpu")
 
         def fast_pos_embed_interpolate(self, grid_thw):
             calls.append(("position", grid_thw[0]))
