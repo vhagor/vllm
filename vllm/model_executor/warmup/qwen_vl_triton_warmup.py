@@ -18,11 +18,16 @@ logger = init_logger(__name__)
 _MROPE_TOKEN_COUNTS = (1, 2, 16)
 
 
-def _warm_vision(model: torch.nn.Module) -> None:
+def _warm_vision(model: torch.nn.Module, device: torch.device) -> None:
     from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
 
     for visual in model.modules():
         if not isinstance(visual, Qwen3_VisionTransformer):
+            continue
+        # CPU offloading keeps tower weights off the accelerator until the
+        # module forward hook copies them back, so warming here would launch
+        # Triton on host pointers.
+        if visual.pos_embed.weight.device.type != device.type:
             continue
         attention = visual.blocks[0].attn
         num_heads = int(attention.num_attention_heads_per_partition)
@@ -70,8 +75,10 @@ def _warm_mrope(runner: "GPUModelRunner", model: torch.nn.Module) -> None:
     if rope is None:
         return
 
-    num_query_heads = int(runner.num_query_heads)
-    num_kv_heads = int(runner.model_config.get_num_kv_heads(runner.parallel_config))
+    model_config = runner.model_config
+    parallel_config = runner.parallel_config
+    num_query_heads = int(model_config.get_num_attention_heads(parallel_config))
+    num_kv_heads = int(model_config.get_num_kv_heads(parallel_config))
     for num_tokens in _MROPE_TOKEN_COUNTS:
         positions = torch.arange(
             num_tokens, dtype=torch.long, device=runner.device
@@ -100,6 +107,6 @@ def _synchronize_device(device: torch.device) -> None:
 def qwen_vl_triton_warmup(runner: "GPUModelRunner") -> None:
     """Warm Qwen3-VL ViT kernels and M-RoPE for ``SupportsMRoPE`` models."""
     model = runner.get_model()
-    _warm_vision(model)
+    _warm_vision(model, runner.device)
     _warm_mrope(runner, model)
     _synchronize_device(runner.device)

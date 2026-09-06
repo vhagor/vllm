@@ -29,6 +29,7 @@ def test_vision_warmup_calls_only_position_and_rotary_paths() -> None:
         def __init__(self) -> None:
             torch.nn.Module.__init__(self)
             self.blocks = [SimpleNamespace(attn=FakeAttention())]
+            self.pos_embed = torch.nn.Embedding(4, 4)
 
         def fast_pos_embed_interpolate(self, grid_thw):
             calls.append(("position", grid_thw[0]))
@@ -43,7 +44,7 @@ def test_vision_warmup_calls_only_position_and_rotary_paths() -> None:
 
     model = torch.nn.Module()
     model.visual = FakeVisual()
-    _warm_vision(model)
+    _warm_vision(model, torch.device("cpu"))
 
     grids = [(1, 16, 16), (1, 16, 2), (1, 2, 16), (1, 2, 2)]
     assert [value for name, value in calls if name == "position"] == [
@@ -52,6 +53,12 @@ def test_vision_warmup_calls_only_position_and_rotary_paths() -> None:
     assert [value for name, value in calls if name == "rotary"] == [
         torch.Size((2, h * w, 4, 8)) for _, h, w in grids
     ]
+
+    # CPU offloading leaves tower weights off the accelerator, so the Triton
+    # paths must not be launched on host pointers.
+    calls.clear()
+    _warm_vision(model, torch.device("cuda"))
+    assert calls == []
 
 
 def test_mrope_warmup_launches_triton_shapes() -> None:
@@ -83,8 +90,8 @@ def test_mrope_warmup_launches_triton_shapes() -> None:
             raise AssertionError("warmup must not build live M-RoPE positions")
 
     runner = SimpleNamespace(
-        num_query_heads=4,
         model_config=SimpleNamespace(
+            get_num_attention_heads=lambda parallel_config: 4,
             get_num_kv_heads=lambda parallel_config: 2,
         ),
         parallel_config=object(),
@@ -104,8 +111,7 @@ def test_mrope_warmup_skips_models_without_supports_mrope() -> None:
         raise AssertionError("M-RoPE warmup must not run without SupportsMRoPE")
 
     runner = SimpleNamespace(
-        num_query_heads=4,
-        model_config=SimpleNamespace(get_num_kv_heads=fail),
+        model_config=SimpleNamespace(get_num_attention_heads=fail),
         get_model=fail,
     )
     _warm_mrope(runner, torch.nn.Module())
