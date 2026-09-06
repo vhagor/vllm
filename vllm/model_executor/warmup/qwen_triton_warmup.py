@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from typing_extensions import TypeIs
 
 from vllm.logger import init_logger
 
@@ -39,7 +38,7 @@ class _QwenGDNWarmupConfig:
     conv_kernel_size: int
     conv_state: torch.Tensor
     conv_dtype: torch.dtype
-    norm_weight_dtype: torch.dtype | None
+    norm_weight_dtype: torch.dtype
     norm_before_gate: bool
     norm_activation: str
     a_log: torch.Tensor
@@ -52,7 +51,7 @@ class _QwenGDNWarmupConfig:
         return 2 * self.h * self.k + self.hv * self.v
 
 
-def _is_non_empty_tensor(value: object) -> TypeIs[torch.Tensor]:
+def _is_non_empty_tensor(value: object) -> bool:
     return isinstance(value, torch.Tensor) and value.numel() > 0
 
 
@@ -97,16 +96,6 @@ def _split_qwen_gdn_cache(kv_cache: object) -> tuple[torch.Tensor, torch.Tensor]
     return None
 
 
-def _gdn_norm_fields(layer: object) -> tuple[torch.dtype | None, bool, str]:
-    norm = getattr(layer, "norm", None)
-    if norm is None:
-        return None, False, ""
-    weight = getattr(norm, "weight", None)
-    if not _is_non_empty_tensor(weight):
-        return None, False, ""
-    return weight.dtype, bool(norm.norm_before_gate), str(norm.activation)
-
-
 def _qwen_gdn_warmup_config(
     static_forward_context: object,
 ) -> _QwenGDNWarmupConfig | None:
@@ -128,7 +117,7 @@ def _qwen_gdn_warmup_config(
         tp_size = int(layer.tp_size)
         h = int(layer.num_k_heads) // tp_size
         hv = int(layer.num_v_heads) // tp_size
-        norm_weight_dtype, norm_before_gate, norm_activation = _gdn_norm_fields(layer)
+        norm = layer.norm
 
         return _QwenGDNWarmupConfig(
             h=h,
@@ -138,9 +127,9 @@ def _qwen_gdn_warmup_config(
             conv_kernel_size=int(layer.conv_kernel_size),
             conv_state=conv_state,
             conv_dtype=conv_state.dtype,
-            norm_weight_dtype=norm_weight_dtype,
-            norm_before_gate=norm_before_gate,
-            norm_activation=norm_activation,
+            norm_weight_dtype=norm.weight.dtype,
+            norm_before_gate=bool(norm.norm_before_gate),
+            norm_activation=str(norm.activation),
             a_log=layer.A_log,
             dt_bias=layer.dt_bias,
             state_stride_token=int(ssm_state.stride(0)),
@@ -158,16 +147,12 @@ def _warm_gated_rms_norm_kernel(
     device: torch.device,
     config: _QwenGDNWarmupConfig,
     max_num_tokens: int,
-    x_dtype: torch.dtype | None = None,
+    x_dtype: torch.dtype,
 ) -> None:
     from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
         warmup_layer_norm_fwd,
     )
 
-    if config.norm_weight_dtype is None or max_num_tokens < 1 or config.hv < 1:
-        return
-    if x_dtype is None:
-        x_dtype = config.conv_dtype
     warmup_layer_norm_fwd(
         max_num_tokens=max_num_tokens,
         rows_per_token=config.hv,
@@ -299,10 +284,8 @@ def qwen_triton_warmup(
     model_config: "ModelConfig",
 ) -> None:
     """Warm Qwen GDN Triton kernels reported by the JIT monitor."""
-    model_type = str(
-        getattr(model_config.hf_text_config, "model_type", None)
-        or getattr(model_config.hf_config, "model_type", None)
-        or ""
+    model_type = getattr(model_config.hf_text_config, "model_type", "") or getattr(
+        model_config.hf_config, "model_type", ""
     )
     if model_type not in _QWEN_MODEL_TYPES:
         return
@@ -316,9 +299,8 @@ def qwen_triton_warmup(
     if gdn_config is None:
         return
 
-    _warm_gated_rms_norm_kernel(
-        device, gdn_config, max(1, int(runner.max_num_tokens)), model_config.dtype
-    )
+    max_num_tokens = max(1, int(runner.max_num_tokens))
+    _warm_gated_rms_norm_kernel(device, gdn_config, max_num_tokens, model_config.dtype)
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.
